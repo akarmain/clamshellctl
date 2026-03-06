@@ -1,0 +1,382 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_NAME="clamshellctl"
+STATE_DIR="${HOME}/.clamshellctl"
+PID_FILE="${STATE_DIR}/caffeinate.pid"
+PMSET_BACKUP_FILE="${STATE_DIR}/disablesleep.previous"
+SYSTEM_INSTALL_TARGET="/usr/local/bin/${APP_NAME}"
+USER_INSTALL_TARGET="${HOME}/.local/bin/${APP_NAME}"
+PARSED_TIMEOUT_SECONDS="0"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  clamshellctl on [MINUTES]          Enable keep-awake mode
+  clamshellctl on --minutes MINUTES  Enable keep-awake mode for N minutes
+  clamshellctl off                   Disable keep-awake mode and restore previous settings
+  clamshellctl status                Show current status
+  clamshellctl install [--user]      Install command into PATH
+  clamshellctl help                  Show this help
+
+Notes:
+  - Requires macOS.
+  - Uses `caffeinate` plus `sudo pmset -a disablesleep 1`.
+  - Closed-lid operation can cause overheating in a bag.
+EOF
+}
+
+error() {
+  echo "[$APP_NAME] $*" >&2
+}
+
+run_pmset_disablesleep() {
+  local value="$1"
+  if [[ "$value" != "0" && "$value" != "1" ]]; then
+    error "Invalid disablesleep value: $value"
+    exit 1
+  fi
+
+  if [[ "${EUID}" -eq 0 ]]; then
+    pmset -a disablesleep "$value"
+    return 0
+  fi
+
+  # Terminal flow: normal sudo prompt.
+  if [[ -t 0 ]] || [[ -t 1 ]]; then
+    echo "Requesting admin privileges via sudo..."
+    sudo pmset -a disablesleep "$value"
+    return 0
+  fi
+
+  # GUI/non-tty flow: show macOS admin password dialog.
+  if command -v osascript >/dev/null 2>&1; then
+    local script
+    script="do shell script \"/usr/bin/pmset -a disablesleep ${value}\" with administrator privileges"
+    osascript -e "$script"
+    return 0
+  fi
+
+  error "Cannot request admin privileges in non-interactive mode."
+  exit 1
+}
+
+require_macos() {
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    error "This tool only supports macOS."
+    exit 1
+  fi
+}
+
+require_cmd() {
+  local cmd="$1"
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    error "Required command is missing: $cmd"
+    exit 1
+  fi
+}
+
+ensure_state_dir() {
+  mkdir -p "$STATE_DIR"
+}
+
+resolve_script_path() {
+  local source="${BASH_SOURCE[0]}"
+  while [[ -L "$source" ]]; do
+    local dir
+    dir="$(cd -P "$(dirname "$source")" && pwd)"
+    source="$(readlink "$source")"
+    if [[ "$source" != /* ]]; then
+      source="${dir}/${source}"
+    fi
+  done
+
+  local dir
+  dir="$(cd -P "$(dirname "$source")" && pwd)"
+  echo "${dir}/$(basename "$source")"
+}
+
+minutes_to_seconds() {
+  local minutes="$1"
+  if ! [[ "$minutes" =~ ^[0-9]+$ ]]; then
+    error "Minutes must be a positive integer: $minutes"
+    return 1
+  fi
+
+  if (( 10#$minutes < 1 )); then
+    error "Minutes must be greater than 0."
+    return 1
+  fi
+
+  echo $((10#$minutes * 60))
+}
+
+parse_on_timeout_seconds() {
+  local timeout_seconds="0"
+  local has_minutes=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -m|--minutes)
+        local opt_name="$1"
+        shift
+        if [[ $# -eq 0 ]]; then
+          error "Missing value for ${opt_name}"
+          return 1
+        fi
+        if (( has_minutes )); then
+          error "Minutes are specified more than once."
+          return 1
+        fi
+        timeout_seconds="$(minutes_to_seconds "$1")" || return 1
+        has_minutes=1
+        ;;
+      *)
+        if (( has_minutes )); then
+          error "Unexpected argument: $1"
+          return 1
+        fi
+        timeout_seconds="$(minutes_to_seconds "$1")" || return 1
+        has_minutes=1
+        ;;
+    esac
+    shift
+  done
+
+  PARSED_TIMEOUT_SECONDS="$timeout_seconds"
+}
+
+pmset_disablesleep_value() {
+  local value
+  value="$(pmset -g custom 2>/dev/null | awk '/disablesleep/ {print $2; exit}' || true)"
+  if [[ -z "${value}" ]]; then
+    echo "0"
+  else
+    echo "$value"
+  fi
+}
+
+is_caffeinate_running() {
+  if [[ -f "$PID_FILE" ]]; then
+    local pid
+    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [[ -n "${pid}" ]] && kill -0 "$pid" >/dev/null 2>&1; then
+      return 0
+    fi
+    rm -f "$PID_FILE" >/dev/null 2>&1 || true
+  fi
+  return 1
+}
+
+start_timed_mode() {
+  local timeout_seconds="$1"
+
+  (
+    set -euo pipefail
+
+    local caffeinate_pid=""
+    cleanup_caffeinate() {
+      if [[ -n "$caffeinate_pid" ]] && kill -0 "$caffeinate_pid" >/dev/null 2>&1; then
+        kill "$caffeinate_pid" >/dev/null 2>&1 || true
+        wait "$caffeinate_pid" >/dev/null 2>&1 || true
+      fi
+    }
+    trap cleanup_caffeinate TERM INT
+
+    caffeinate -dimsu -t "$timeout_seconds" &
+    caffeinate_pid=$!
+    wait "$caffeinate_pid" >/dev/null 2>&1 || true
+
+    local recorded_pid
+    recorded_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [[ "$recorded_pid" != "$BASHPID" ]]; then
+      exit 0
+    fi
+    rm -f "$PID_FILE"
+
+    local restore_value="0"
+    if [[ -f "$PMSET_BACKUP_FILE" ]]; then
+      restore_value="$(cat "$PMSET_BACKUP_FILE" 2>/dev/null || echo 0)"
+      rm -f "$PMSET_BACKUP_FILE"
+    fi
+    if [[ "$restore_value" != "0" && "$restore_value" != "1" ]]; then
+      restore_value="0"
+    fi
+
+    run_pmset_disablesleep "$restore_value" || true
+  ) >/dev/null 2>&1 &
+
+  local manager_pid=$!
+  echo "$manager_pid" > "$PID_FILE"
+}
+
+enable_mode() {
+  local timeout_seconds="${1:-0}"
+  ensure_state_dir
+
+  if is_caffeinate_running; then
+    echo "Keep-awake mode is already enabled."
+    status
+    return 0
+  fi
+
+  local current_disablesleep
+  current_disablesleep="$(pmset_disablesleep_value || true)"
+  if [[ -z "${current_disablesleep}" ]]; then
+    current_disablesleep="0"
+  fi
+  echo "$current_disablesleep" > "$PMSET_BACKUP_FILE"
+
+  echo "Enabling keep-awake mode..."
+  echo "WARNING: closed-lid mode may cause overheating in a bag."
+  run_pmset_disablesleep 1
+
+  local pid
+  if (( timeout_seconds > 0 )); then
+    start_timed_mode "$timeout_seconds"
+    pid="$(cat "$PID_FILE")"
+  else
+    caffeinate -dimsu &
+    pid=$!
+    echo "$pid" > "$PID_FILE"
+  fi
+
+  echo "Keep-awake mode enabled."
+  if (( timeout_seconds > 0 )); then
+    echo "Duration: $((timeout_seconds / 60)) minute(s)"
+    echo "manager PID: $pid"
+  else
+    echo "caffeinate PID: $pid"
+  fi
+  status
+}
+
+disable_mode() {
+  ensure_state_dir
+  echo "Disabling keep-awake mode..."
+
+  if is_caffeinate_running; then
+    local pid
+    pid="$(cat "$PID_FILE")"
+    kill "$pid" >/dev/null 2>&1 || true
+    rm -f "$PID_FILE"
+  else
+    rm -f "$PID_FILE"
+  fi
+
+  local restore_value="0"
+  if [[ -f "$PMSET_BACKUP_FILE" ]]; then
+    restore_value="$(cat "$PMSET_BACKUP_FILE" 2>/dev/null || echo 0)"
+    rm -f "$PMSET_BACKUP_FILE"
+  fi
+  if [[ "$restore_value" != "0" && "$restore_value" != "1" ]]; then
+    restore_value="0"
+  fi
+
+  run_pmset_disablesleep "$restore_value"
+
+  echo "Keep-awake mode disabled."
+  status
+}
+
+status() {
+  local caffeinate_state="stopped"
+  local caffeinate_pid="-"
+  if is_caffeinate_running; then
+    caffeinate_state="running"
+    caffeinate_pid="$(cat "$PID_FILE")"
+  fi
+
+  local ds_value
+  ds_value="$(pmset_disablesleep_value || true)"
+  if [[ -z "${ds_value}" ]]; then
+    ds_value="0"
+  fi
+
+  echo "Status:"
+  echo "  caffeinate: ${caffeinate_state} (pid: ${caffeinate_pid})"
+  echo "  pmset disablesleep: ${ds_value}"
+}
+
+install_command() {
+  local target="$SYSTEM_INSTALL_TARGET"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --user)
+        target="$USER_INSTALL_TARGET"
+        ;;
+      *)
+        error "Unknown install option: $1"
+        exit 1
+        ;;
+    esac
+    shift
+  done
+
+  local source_path
+  source_path="$(resolve_script_path)"
+  local target_dir
+  target_dir="$(dirname "$target")"
+
+  if [[ "$target" == "$USER_INSTALL_TARGET" ]]; then
+    mkdir -p "$target_dir"
+    ln -sf "$source_path" "$target"
+    echo "Installed: $target"
+    if [[ ":$PATH:" != *":${target_dir}:"* ]]; then
+      echo "Add this to your shell profile:"
+      echo "  export PATH=\"${target_dir}:\$PATH\""
+    fi
+    return 0
+  fi
+
+  if [[ "${EUID}" -eq 0 ]] || [[ -w "$target_dir" ]]; then
+    mkdir -p "$target_dir"
+    ln -sf "$source_path" "$target"
+  else
+    echo "Installing to ${target} (sudo required)..."
+    sudo mkdir -p "$target_dir"
+    sudo ln -sf "$source_path" "$target"
+  fi
+
+  echo "Installed: $target"
+}
+
+main() {
+  local cmd="${1:-help}"
+  shift || true
+  case "$cmd" in
+    on)
+      require_macos
+      require_cmd pmset
+      require_cmd caffeinate
+      parse_on_timeout_seconds "$@"
+      enable_mode "$PARSED_TIMEOUT_SECONDS"
+      ;;
+    off)
+      require_macos
+      require_cmd pmset
+      require_cmd caffeinate
+      disable_mode
+      ;;
+    status)
+      require_macos
+      require_cmd pmset
+      require_cmd caffeinate
+      status
+      ;;
+    install)
+      install_command "$@"
+      ;;
+    help|-h|--help)
+      usage
+      ;;
+    *)
+      error "Unknown command: $cmd"
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
