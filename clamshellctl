@@ -82,7 +82,13 @@ ensure_state_dir() {
 
 resolve_script_path() {
   local source="${BASH_SOURCE[0]}"
+  local depth=0
   while [[ -L "$source" ]]; do
+    depth=$((depth + 1))
+    if (( depth > 40 )); then
+      error "Symlink loop detected while resolving script path: $source"
+      return 1
+    fi
     local dir
     dir="$(cd -P "$(dirname "$source")" && pwd)"
     source="$(readlink "$source")"
@@ -94,6 +100,36 @@ resolve_script_path() {
   local dir
   dir="$(cd -P "$(dirname "$source")" && pwd)"
   echo "${dir}/$(basename "$source")"
+}
+
+normalize_install_source() {
+  local source_path="$1"
+
+  # If command was invoked via a symlink that points to a repository directory,
+  # use the script file inside that directory.
+  if [[ -d "$source_path" ]]; then
+    local candidate="${source_path}/${APP_NAME}"
+    if [[ -f "$candidate" ]]; then
+      source_path="$candidate"
+    else
+      error "Resolved install source is a directory: $source_path"
+      error "Run install from the repository root that contains ./${APP_NAME}."
+      return 1
+    fi
+  fi
+
+  if [[ ! -f "$source_path" ]]; then
+    error "Install source does not exist: $source_path"
+    return 1
+  fi
+
+  if [[ ! -x "$source_path" ]]; then
+    error "Install source is not executable: $source_path"
+    error "Run: chmod +x \"$source_path\""
+    return 1
+  fi
+
+  echo "$source_path"
 }
 
 minutes_to_seconds() {
@@ -316,8 +352,14 @@ install_command() {
 
   local source_path
   source_path="$(resolve_script_path)"
+  source_path="$(normalize_install_source "$source_path")"
   local target_dir
   target_dir="$(dirname "$target")"
+
+  if [[ "$source_path" == "$target" ]]; then
+    echo "Installed: $target"
+    return 0
+  fi
 
   if [[ "$target" == "$USER_INSTALL_TARGET" ]]; then
     mkdir -p "$target_dir"

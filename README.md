@@ -76,6 +76,30 @@ clamshellctl help
 
 ---
 
+## 🛠 Troubleshooting
+
+Если при запуске видишь:
+
+- `zsh: permission denied: clamshellctl`
+- `zsh: too many levels of symbolic links: ./clamshellctl`
+
+значит сломалась символическая ссылка установки.
+
+Починка:
+
+```bash
+cd /path/to/clamshellctl-repo
+chmod +x ./clamshellctl
+rm -f ~/.local/bin/clamshellctl
+ln -s "$(pwd)/clamshellctl" ~/.local/bin/clamshellctl
+rehash
+clamshellctl help
+```
+
+После обновления скрипта `install --user` дополнительно проверяет источник и защищается от циклов симлинков.
+
+---
+
 ## ⚠️ Важно
 
 - При закрытой крышке без охлаждения возможен перегрев.
